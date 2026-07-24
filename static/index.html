@@ -888,9 +888,12 @@ function onPcm(chunk){
       capturing=true; speechFrames=preRoll.slice(); preRoll=[];
       speechSamples=speechFrames.reduce((a,c)=>a+c.length,0); silentSamples=0; voicedSamples=0;
       clearNoReply();
+      micStreamOpen = STREAM_MIC && !httpMode && ws && ws.readyState===1;
+      if(micStreamOpen){ wsSend({type:'mic_start', sample_rate:16000}); streamSent=0; }
     }
   }else{
     speechFrames.push(chunk); speechSamples+=n;
+    if(micStreamOpen) pumpMicStream(false);
     if(rms<silT){ silentSamples+=n; } else { silentSamples=0; voicedSamples+=n; }
     const voicedMs=voicedSamples/srate*1000;
     const endPauseMs=(voicedMs>=MIN_COMPLETE_MS)?SILENCE_END_MS:FRAGMENT_WAIT_MS;
@@ -898,22 +901,58 @@ function onPcm(chunk){
     if(silentSamples>=silenceEnd || speechSamples>=maxS){ endTurn(); }
   }
 }
+// ── Streamed mic upload: ship audio to the server WHILE the caller is still speaking, so at
+// end-of-turn only the last ~250ms remains to send — the whole-utterance upload no longer sits
+// between "caller stopped" and "agent starts thinking". Frames are downsampled to 16k int16
+// client-side (same math as the batch path) and sent as WS binary between mic_start/mic_end.
+const STREAM_MIC = true;              // kill switch — false restores record-then-send
+const STREAM_CHUNK_MS = 250;
+let micStreamOpen=false, streamSent=0; // streamSent = how many source samples already shipped
+function pumpMicStream(flush){
+  const totalLen = speechFrames.reduce((a,c)=>a+c.length,0);
+  const pending = totalLen - streamSent;
+  if(pending <= 0) return;
+  if(!flush && pending < srate*STREAM_CHUNK_MS/1000) return;
+  if(!(ws && ws.readyState===1)){ micStreamOpen=false; return; }
+  const all=new Float32Array(pending); let o=0, skip=streamSent;
+  for(const f of speechFrames){
+    if(skip>=f.length){ skip-=f.length; continue; }
+    const part=skip? f.subarray(skip): f; skip=0;
+    all.set(part,o); o+=part.length;
+  }
+  streamSent = totalLen;
+  const i16 = floatTo16(downsample(all, srate, 16000));
+  ws.send(i16.buffer);
+}
 function endTurn(){
   capturing=false;
   clearNoReply();
-  const frames=speechFrames; speechFrames=[];
+  const streamed = micStreamOpen; micStreamOpen=false;
+  const frames=speechFrames;
   const durMs = frames.reduce((a,c)=>a+c.length,0)/srate*1000;
-  silentSamples=0; speechSamples=0; voicedSamples=0;
-  if(durMs<MIN_SPEECH_MS){ if(listening && !endingCall) armNoReply(); return; }
+  if(durMs<MIN_SPEECH_MS){
+    speechFrames=[]; silentSamples=0; speechSamples=0; voicedSamples=0;
+    if(streamed) wsSend({type:'mic_abort'});   // server discards the partial buffer
+    if(listening && !endingCall) armNoReply();
+    return;
+  }
   noReplyCount=0;
-  let len=0; frames.forEach(f=>len+=f.length);
-  const all=new Float32Array(len); let o=0; frames.forEach(f=>{all.set(f,o);o+=f.length;});
-  const ds=downsample(all, srate, 16000);
-  const wav=encodeWAV(floatTo16(ds), 16000);
   waitingForServer=true;
   setPill('transcribing');
   if(turnsSent>0) scheduleFiller();
   turnsSent++;
+  if(streamed && ws && ws.readyState===1){
+    pumpMicStream(true);                        // ship the tail
+    speechFrames=[]; silentSamples=0; speechSamples=0; voicedSamples=0;
+    wsSend({type:'mic_end', duration_ms:Math.round(durMs)});
+    return;
+  }
+  speechFrames=[];
+  silentSamples=0; speechSamples=0; voicedSamples=0;
+  let len=0; frames.forEach(f=>len+=f.length);
+  const all=new Float32Array(len); let o=0; frames.forEach(f=>{all.set(f,o);o+=f.length;});
+  const ds=downsample(all, srate, 16000);
+  const wav=encodeWAV(floatTo16(ds), 16000);
   if(httpMode){ postTurn({wav: wav}); return; }
   if(ws&&ws.readyState===1){
     ws.send(JSON.stringify({type:'turn_meta',format:'wav',sample_rate:16000,duration_ms:Math.round(durMs)}));

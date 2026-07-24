@@ -11,6 +11,7 @@ _QUERY_TOOLS).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -114,6 +115,14 @@ def _key_tiers() -> tuple[list[int], list[int]]:
 _FRESH_ORDER, _OTHER_ORDER = _key_tiers()
 _fresh_idx = 0
 _other_idx = 0
+
+# HEDGED REQUESTS (staggered by default — see the block in _generate): a backup request on a
+# second key fires only if the first is slower than GEMINI_HEDGE_AFTER_MS. Simultaneous racing
+# (set GEMINI_HEDGE=2+ AND a tiny HEDGE_AFTER_MS) was measured harmful on this free-tier pool:
+# doubled burst rate 429'd the fresh tier within ~6 turns, median 1.60s→1.76s, then cascaded
+# into failed turns. The stagger keeps the median untouched and still cuts the rare 12s stalls.
+_HEDGE = max(1, _int_env("GEMINI_HEDGE", 1))
+_HEDGE_AFTER_MS = max(250, _int_env("GEMINI_HEDGE_AFTER_MS", 3500))
 
 
 # Let the model THINK briefly before it answers — this is what turns a reflexive, bot-like
@@ -267,7 +276,7 @@ _cooldown: dict[int, float] = {}
 
 
 async def _generate(contents: list, scenario: str = "lead", lang: str = "",
-                    force_tool: bool = False) -> dict:
+                    force_tool: bool = False, hedge: bool = True) -> dict:
     global _fresh_idx, _other_idx, last_attempt_count, last_served_by
     if not _KEYS:
         raise RuntimeError("No Gemini API key set")
@@ -282,52 +291,125 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
     last_served_by = ""
     now = time.time()
     all_cooling = all(_cooldown.get(i, 0) > now for i in range(len(_KEYS)))
+
+    def _body_for(key_idx: int) -> tuple[str, dict]:
+        model = _model_for_key_idx(key_idx)
+        gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
+        thinking = _thinking_config_for(model)
+        if thinking:
+            gen_config["thinkingConfig"] = thinking
+        return model, {
+            "systemInstruction": {"parts": [{"text": system_text}]},
+            "contents": contents,
+            "tools": tools,
+            "toolConfig": tool_config,
+            "generationConfig": gen_config,
+        }
+
+    # STAGGERED hedge: launch on ONE key; only if it hasn't answered within
+    # GEMINI_HEDGE_AFTER_MS (default 3500 — past ~p90) launch a backup on a second key and take
+    # whichever answers first. Measured 2026-07-24: flash-latest is 1.3-1.9s typical but throws
+    # rare 12s+ stalls (x1 attempt — the call itself, not rotation). SIMULTANEOUS racing
+    # (GEMINI_HEDGE>=2) cut that tail but doubled burst rate, 429-cascaded the free-tier pool
+    # and made the median WORSE — the stagger gets the tail cut at ~zero steady-state cost
+    # (backup fires on only the slowest few % of turns). GEMINI_HEDGE=1 + huge HEDGE_AFTER_MS
+    # effectively disables it.
+    if hedge and _FRESH_ORDER and _HEDGE_AFTER_MS < 60_000:
+        picks = []
+        cur = _fresh_idx
+        for _ in range(len(_FRESH_ORDER)):
+            if len(picks) >= max(2, _HEDGE):
+                break
+            cur = (cur + 1) % len(_FRESH_ORDER)
+            k = _FRESH_ORDER[cur]
+            if k in (p[0] for p in picks):
+                continue
+            if not all_cooling and _cooldown.get(k, 0) > time.time():
+                continue
+            picks.append((k,) + _body_for(k))
+        _fresh_idx = cur
+        if len(picks) >= 2:
+            async def _race_one(key_idx: int, model: str, body: dict):
+                resp = await client.post(_URL.format(model=model),
+                                          params={"key": _KEYS[key_idx]}, json=body)
+                return key_idx, model, resp
+
+            primary = asyncio.ensure_future(_race_one(*picks[0]))
+            tasks = [primary]
+            try:
+                done, _p = await asyncio.wait({primary}, timeout=_HEDGE_AFTER_MS / 1000)
+                if not done:  # primary is slow — fire the backup and race them
+                    tasks.append(asyncio.ensure_future(_race_one(*picks[1])))
+                pending = set(tasks)
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            key_idx, model, resp = t.result()
+                        except Exception:
+                            continue
+                        last_attempt_count += 1
+                        if resp.status_code < 400:
+                            _cooldown.pop(key_idx, None)
+                            tag = "~backup" if len(tasks) > 1 else ""
+                            last_served_by = f"key{key_idx + 1}/{model}{tag}"
+                            return resp.json()
+                        last_err = f"Gemini {resp.status_code} (key {key_idx + 1}, {model}): {resp.text[:160]}"
+                        if _should_rotate(resp.status_code, resp.text):
+                            _cooldown[key_idx] = time.time() + (60 if resp.status_code == 429 else 15)
+                # every racer failed → fall through to the sequential walk
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
     # Try the FRESH tier first (round-robin among just those keys — spreads load the same way
     # a flat pool would, but only within the fresh set), then fall through to the OTHER tier
     # only once every fresh key has failed this turn. See _key_tiers(). Each key uses ITS OWN
     # model (see _model_for_key_idx) regardless of tier — a mixed pool serves every key's real
     # capacity instead of wasting a call on every 404 before finding one that works.
-    for order, cur in ((_FRESH_ORDER, _fresh_idx), (_OTHER_ORDER, _other_idx)):
-        if not order:
-            continue
-        if len(order) > 1:
-            cur = (cur + 1) % len(order)
-        for _ in range(len(order)):
-            key_idx = order[cur]
-            # Skip keys still cooling down from a recent 429/5xx — unless literally every key
-            # is cooling, in which case trying beats certain failure.
-            if not all_cooling and _cooldown.get(key_idx, 0) > time.time():
-                cur = (cur + 1) % len(order)
+    # Pass 1 respects cooldowns; pass 2 (reached only if pass 1 found NOTHING usable) ignores
+    # them — a cooldown cascade must degrade to "try anyway", never to a failed turn. (The old
+    # single-shot all_cooling snapshot went stale mid-request and did exactly that.)
+    for respect_cooldowns in (True, False):
+        for order, cur in ((_FRESH_ORDER, _fresh_idx), (_OTHER_ORDER, _other_idx)):
+            if not order:
                 continue
-            model = _model_for_key_idx(key_idx)
-            gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
-            thinking = _thinking_config_for(model)
-            if thinking:
-                gen_config["thinkingConfig"] = thinking
-            body = {
-                "systemInstruction": {"parts": [{"text": system_text}]},
-                "contents": contents,
-                "tools": tools,
-                "toolConfig": tool_config,
-                "generationConfig": gen_config,
-            }
-            url = _URL.format(model=model)
-            last_attempt_count += 1
-            resp = await client.post(url, params={"key": _KEYS[key_idx]}, json=body)
-            if order is _FRESH_ORDER:
-                _fresh_idx = cur
-            else:
-                _other_idx = cur
-            if resp.status_code < 400:
-                _cooldown.pop(key_idx, None)
-                last_served_by = f"key{key_idx + 1}/{model}"
-                return resp.json()
-            last_err = f"Gemini {resp.status_code} (key {key_idx + 1}/{len(_KEYS)}, {model}): {resp.text[:160]}"
-            if _should_rotate(resp.status_code, resp.text):
-                _cooldown[key_idx] = time.time() + (60 if resp.status_code == 429 else 15)
+            if len(order) > 1:
                 cur = (cur + 1) % len(order)
-                continue
-            raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:300]}")
+            for _ in range(len(order)):
+                key_idx = order[cur]
+                if respect_cooldowns and _cooldown.get(key_idx, 0) > time.time():
+                    cur = (cur + 1) % len(order)
+                    continue
+                model = _model_for_key_idx(key_idx)
+                gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
+                thinking = _thinking_config_for(model)
+                if thinking:
+                    gen_config["thinkingConfig"] = thinking
+                body = {
+                    "systemInstruction": {"parts": [{"text": system_text}]},
+                    "contents": contents,
+                    "tools": tools,
+                    "toolConfig": tool_config,
+                    "generationConfig": gen_config,
+                }
+                url = _URL.format(model=model)
+                last_attempt_count += 1
+                resp = await client.post(url, params={"key": _KEYS[key_idx]}, json=body)
+                if order is _FRESH_ORDER:
+                    _fresh_idx = cur
+                else:
+                    _other_idx = cur
+                if resp.status_code < 400:
+                    _cooldown.pop(key_idx, None)
+                    last_served_by = f"key{key_idx + 1}/{model}"
+                    return resp.json()
+                last_err = f"Gemini {resp.status_code} (key {key_idx + 1}/{len(_KEYS)}, {model}): {resp.text[:160]}"
+                if _should_rotate(resp.status_code, resp.text):
+                    _cooldown[key_idx] = time.time() + (60 if resp.status_code == 429 else 15)
+                    cur = (cur + 1) % len(order)
+                    continue
+                raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:300]}")
     raise RuntimeError("All Gemini keys exhausted — " + (last_err or "quota/invalid"))
 
 
@@ -347,10 +429,13 @@ async def gemini_turn(contents: list, user_text: str, handlers: dict, scenario: 
     # ALWAYS recorded.
     force_tool = "(System note" in (user_text or "") and "CALL " in (user_text or "")
 
-    for _ in range(5):  # allow a couple of tool round-trips
+    for turn_i in range(5):  # allow a couple of tool round-trips
         try:
+            # Hedge only the first call of the turn — tool-followup calls are rare and the
+            # racing setup isn't worth doubling their quota cost.
             data = await _generate(contents, scenario, lang,
-                                   force_tool=force_tool and last_tool is None)
+                                   force_tool=force_tool and last_tool is None,
+                                   hedge=turn_i == 0)
         except Exception:
             # If a tool already saved this turn, give a graceful spoken confirmation instead
             # of surfacing a raw error (e.g. when the follow-up call hits a Gemini 429).

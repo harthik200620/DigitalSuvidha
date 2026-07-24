@@ -114,6 +114,15 @@ _RETRY_LINE = {
 _WARMED = False
 
 
+def _pcm16_to_wav(pcm: bytes, sr: int = 16000) -> bytes:
+    """Wrap raw mono 16-bit PCM (the streamed-mic frames) in a minimal WAV header."""
+    import struct
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+           + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+           + b"data" + struct.pack("<I", len(pcm)))
+    return hdr + pcm
+
+
 @app.post("/api/fillers")
 async def api_fillers(password: str = Form(default=""), scenario: str = Form(default=""),
                       lang: str = Form(default="")):
@@ -470,7 +479,13 @@ async def ws_endpoint(ws: WebSocket):
                 break
 
             if msg.get("bytes") is not None:
-                await _process_audio(ws, state, msg["bytes"])
+                # Streamed-mic mode: between mic_start/mic_end the binary frames are raw 16k
+                # PCM16 chunks shipped WHILE the caller speaks — buffer them. Otherwise it's
+                # the legacy single complete-WAV upload.
+                if state.get("mic_frames") is not None:
+                    state["mic_frames"].append(msg["bytes"])
+                else:
+                    await _process_audio(ws, state, msg["bytes"])
                 continue
 
             raw = msg.get("text")
@@ -479,7 +494,16 @@ async def ws_endpoint(ws: WebSocket):
             data = json.loads(raw)
             mtype = data.get("type")
 
-            if mtype == "hello":
+            if mtype == "mic_start":
+                state["mic_frames"] = []
+            elif mtype == "mic_end":
+                frames = state.get("mic_frames") or []
+                state["mic_frames"] = None
+                if frames:
+                    await _process_audio(ws, state, _pcm16_to_wav(b"".join(frames)))
+            elif mtype == "mic_abort":
+                state["mic_frames"] = None
+            elif mtype == "hello":
                 if data.get("scenario"):
                     state["scenario"] = data["scenario"]
                 if data.get("lang"):
