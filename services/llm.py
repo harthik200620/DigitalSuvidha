@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -255,9 +256,19 @@ def _should_rotate(status: int, text: str) -> bool:
     return False
 
 
+# Per-instance latency telemetry + quota memory. `last_attempt_count`/`last_served_by` describe
+# the most recent _generate() call (read by main.py's timing line). `_cooldown` remembers keys
+# that just 429'd (60s) or 5xx'd (15s) so a quota-dead key costs ONE probe per window instead of
+# one failed round-trip (~0.3-0.6s each) on EVERY request — a 10-dead-key walk used to add
+# seconds to every single turn while staying invisible in low-volume local tests.
+last_attempt_count = 0
+last_served_by = ""
+_cooldown: dict[int, float] = {}
+
+
 async def _generate(contents: list, scenario: str = "lead", lang: str = "",
                     force_tool: bool = False) -> dict:
-    global _fresh_idx, _other_idx
+    global _fresh_idx, _other_idx, last_attempt_count, last_served_by
     if not _KEYS:
         raise RuntimeError("No Gemini API key set")
     system_text = build_system_prompt(_today(), scenario, lang)
@@ -267,6 +278,10 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
     tool_config = {"functionCallingConfig": {"mode": "ANY" if force_tool else "AUTO"}}
     last_err = None
     client = _http.client()  # shared keep-alive client (no per-call TLS handshake)
+    last_attempt_count = 0
+    last_served_by = ""
+    now = time.time()
+    all_cooling = all(_cooldown.get(i, 0) > now for i in range(len(_KEYS)))
     # Try the FRESH tier first (round-robin among just those keys — spreads load the same way
     # a flat pool would, but only within the fresh set), then fall through to the OTHER tier
     # only once every fresh key has failed this turn. See _key_tiers(). Each key uses ITS OWN
@@ -279,6 +294,11 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
             cur = (cur + 1) % len(order)
         for _ in range(len(order)):
             key_idx = order[cur]
+            # Skip keys still cooling down from a recent 429/5xx — unless literally every key
+            # is cooling, in which case trying beats certain failure.
+            if not all_cooling and _cooldown.get(key_idx, 0) > time.time():
+                cur = (cur + 1) % len(order)
+                continue
             model = _model_for_key_idx(key_idx)
             gen_config = {"temperature": 0.7, "maxOutputTokens": _max_tokens_for(model)}
             thinking = _thinking_config_for(model)
@@ -292,15 +312,19 @@ async def _generate(contents: list, scenario: str = "lead", lang: str = "",
                 "generationConfig": gen_config,
             }
             url = _URL.format(model=model)
+            last_attempt_count += 1
             resp = await client.post(url, params={"key": _KEYS[key_idx]}, json=body)
             if order is _FRESH_ORDER:
                 _fresh_idx = cur
             else:
                 _other_idx = cur
             if resp.status_code < 400:
+                _cooldown.pop(key_idx, None)
+                last_served_by = f"key{key_idx + 1}/{model}"
                 return resp.json()
             last_err = f"Gemini {resp.status_code} (key {key_idx + 1}/{len(_KEYS)}, {model}): {resp.text[:160]}"
             if _should_rotate(resp.status_code, resp.text):
+                _cooldown[key_idx] = time.time() + (60 if resp.status_code == 429 else 15)
                 cur = (cur + 1) % len(order)
                 continue
             raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:300]}")

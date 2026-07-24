@@ -812,10 +812,11 @@ async function sendTyped(){
 
 // ── Mic capture (Sarvam path): AudioWorklet + energy VAD + WAV encode ─────────
 let capturing=false, speechFrames=[], preRoll=[], silentSamples=0, speechSamples=0, voicedSamples=0, srate=48000;
-// SILENCE_END 500 (was 350): a natural mid-sentence pause in Hindi speech was getting cut as
-// end-of-turn, truncating the utterance's tail. MIN_SPEECH 180 (was 300): real one-word answers
-// ("हाँ", "yes") were being discarded as non-speech.
-const PREROLL_MS=300, SILENCE_END_MS=500, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
+// SILENCE_END 420 (was 350): a natural mid-sentence pause in Hindi speech was getting cut as
+// end-of-turn, truncating the utterance's tail (500 protected more but cost latency on every
+// turn — 420 is the compromise). MIN_SPEECH 180 (was 300): real one-word answers ("हाँ",
+// "yes") were being discarded as non-speech.
+const PREROLL_MS=300, SILENCE_END_MS=420, MIN_SPEECH_MS=180, MAX_TURN_MS=15000;
 const MIN_COMPLETE_MS=700, FRAGMENT_WAIT_MS=1100;
 
 async function startMic(){

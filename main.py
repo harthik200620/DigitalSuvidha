@@ -17,13 +17,18 @@ import base64
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+# override=True: this Windows box has stale machine-level ELEVENLABS_*/SARVAM_* env vars from
+# older projects that silently SHADOW .env (dotenv's default is never-override) — local runs
+# were hitting the wrong ElevenLabs account and falling back to Sarvam. On Vercel there's no
+# .env file (.vercelignore), so this is a no-op there and platform env vars rule as before.
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, File, UploadFile
 from fastapi.responses import FileResponse
@@ -103,6 +108,10 @@ _RETRY_LINE = {
     "hindi": "माफ़ कीजिए जी, आवाज़ कट गई थी — एक बार फिर बता दीजिए?",
     "telugu": "క్షమించండి అండి, లైన్ కట్ అయ్యింది — మరోసారి చెప్పండి?",
 }
+
+# False until this serverless instance serves its first /api/turn — surfaces cold-start cost
+# in the per-turn timing telemetry.
+_WARMED = False
 
 
 @app.post("/api/fillers")
@@ -240,14 +249,22 @@ async def api_turn(
     except Exception:
         contents = []
 
+    global _WARMED
+    cold = not _WARMED
+    _WARMED = True
+    t_start = time.perf_counter()
+    stt_ms = llm_ms = tts_ms = 0
+
     user_text = (text or "").strip()
     transcript = user_text
     if audio is not None:
         wav = await audio.read()
+        t0 = time.perf_counter()
         try:
             transcript = await stt.transcribe_wav(wav, _LANG_CODE.get(lng, "en-IN"))
         except Exception as e:
             return {"error": f"stt: {e}", "history": contents}
+        stt_ms = round((time.perf_counter() - t0) * 1000)
         user_text = transcript
     if not user_text:
         return {"error": "no input", "history": contents}
@@ -265,6 +282,7 @@ async def api_turn(
                 "audio_b64": audio_b64, "audio_mime": mime, "rest_text": None}
 
     captured = {"crm": None}
+    t0 = time.perf_counter()
     try:
         reply = await llm.gemini_turn(contents, user_text,
                                       _handlers_for(scenario, captured),
@@ -276,6 +294,7 @@ async def api_turn(
         reply = _RETRY_LINE.get(lng, _RETRY_LINE["english"])
         # gemini_turn already appended the user's turn; add only the graceful model line.
         contents.append({"role": "model", "parts": [{"text": reply}]})
+    llm_ms = round((time.perf_counter() - t0) * 1000)
 
     # Chat scenario: text is the product — instant replies, no TTS spend.
     if sc["chat"]:
@@ -288,6 +307,7 @@ async def api_turn(
     chunks = _split_for_tts(reply)
     audio_b64, mime, rest_text = None, None, None
     if chunks:
+        t0 = time.perf_counter()
         try:
             a, m = await tts.synthesize(chunks[0], lng)
             if a:
@@ -296,6 +316,17 @@ async def api_turn(
                     rest_text = chunks[1]
         except Exception:
             pass
+        tts_ms = round((time.perf_counter() - t0) * 1000)
+
+    timing = {
+        "stt_ms": stt_ms, "llm_ms": llm_ms, "tts_ms": tts_ms,
+        "total_ms": round((time.perf_counter() - t_start) * 1000),
+        "llm_attempts": llm.last_attempt_count, "served_by": llm.last_served_by,
+        "cold": cold,
+    }
+    # One compact line per turn into the runtime logs — real production stage costs, always on.
+    print(f"[timing] {timing['total_ms']}ms total | stt {stt_ms} | llm {llm_ms} "
+          f"(x{timing['llm_attempts']} {timing['served_by']}) | tts {tts_ms} | cold={cold}")
 
     return {
         "transcript": transcript,
@@ -305,6 +336,7 @@ async def api_turn(
         "audio_b64": audio_b64,
         "audio_mime": mime,
         "rest_text": rest_text,
+        "timing": timing,
     }
 
 
