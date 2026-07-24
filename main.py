@@ -395,6 +395,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     await _send(ws, {"type": "status", "state": "thinking"})
 
     captured = {"crm": None}
+    t_turn = time.perf_counter()
 
     async def on_row(row: dict):
         await _send(ws, {"type": "crm_created", "crm": row})
@@ -410,6 +411,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         print(f"[llm-fail] {type(e).__name__}: {e}")
         assistant_text = _RETRY_LINE.get(lng, _RETRY_LINE["english"])
         state["contents"].append({"role": "model", "parts": [{"text": assistant_text}]})
+    llm_ms = round((time.perf_counter() - t_turn) * 1000)
 
     await _send(ws, {"type": "assistant_text", "role": "assistant", "text": assistant_text})
     db.log_turn(sid, "assistant", assistant_text)
@@ -422,6 +424,7 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
     # Sentence-by-sentence, SEQUENTIAL on purpose: chunk 2 synthesizes while chunk 1 is already
     # playing in the browser, and staying at 1 concurrent request keeps the ElevenLabs free
     # tier (2-concurrent limit) from 429ing when fillers or /api/say overlap.
+    t0 = time.perf_counter()
     for chunk in _split_for_tts(assistant_text):
         try:
             audio, mime = await tts.synthesize(chunk, lng)
@@ -430,18 +433,25 @@ async def _process_text(ws: WebSocket, state: dict, text: str, silent: bool = Fa
         if audio:
             await _send(ws, {"type": "tts_audio_meta", "mime": mime, "bytes": len(audio)})
             await ws.send_bytes(audio)
+    tts_ms = round((time.perf_counter() - t0) * 1000)
+    # Same per-turn stage telemetry as /api/turn — real calls run over WS now (Vercel supports
+    # it), so the runtime logs must cover this path too.
+    print(f"[timing/ws] {round((time.perf_counter() - t_turn) * 1000)}ms total | llm {llm_ms} "
+          f"(x{llm.last_attempt_count} {llm.last_served_by}) | tts {tts_ms}")
     await _send(ws, {"type": "status", "state": "idle"})
 
 
 async def _process_audio(ws: WebSocket, state: dict, wav: bytes):
     await _send(ws, {"type": "status", "state": "transcribing"})
     lng = norm_lang(state.get("lang", ""), state.get("scenario", "consult"))
+    t0 = time.perf_counter()
     try:
         text = await stt.transcribe_wav(wav, _LANG_CODE.get(lng, "en-IN"))
     except Exception as e:
         await _send(ws, {"type": "error", "where": "stt", "message": str(e), "recoverable": True})
         await _send(ws, {"type": "status", "state": "idle"})
         return
+    print(f"[timing/ws] stt {round((time.perf_counter() - t0) * 1000)}ms | {len(wav)}B wav")
     if not text:
         await _send(ws, {"type": "status", "state": "idle", "detail": "no speech detected"})
         return

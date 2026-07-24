@@ -413,7 +413,6 @@ function chooseScenario(s, l){
   if(recog){ try{ recog.lang = langCode(); }catch(e){} }
   getOpening();   // prefetch the opener audio NOW — the call picks up instantly on Start
   init();
-  getOpening();   // warm the intro audio so the agent's first line plays instantly
 }
 
 async function init(){
@@ -429,15 +428,23 @@ async function init(){
 }
 
 // ── The agent speaks first — the opener line (audio cached server-side) ─────
-let openerData=null, turnsSent=0, callOpened=false;
+// In-flight dedup: without it, back-to-back prefetch calls each POST /api/opening before the
+// first resolves — concurrent synths of the SAME line trip ElevenLabs' free-tier 2-concurrent
+// cap (real 429s + retry backoff seen in production logs right at call pickup).
+let openerData=null, openerPromise=null, turnsSent=0, callOpened=false;
 async function getOpening(){
   if(openerData) return openerData;
-  try{
-    const fd=new FormData(); fd.append('password', adminPw); fd.append('scenario', sessionScenario);
-    fd.append('lang', sessionLang);
-    openerData = await (await fetch('/api/opening',{method:'POST',body:fd})).json();
-  }catch(e){ openerData=null; }
-  return openerData;
+  if(openerPromise) return openerPromise;
+  openerPromise = (async()=>{
+    try{
+      const fd=new FormData(); fd.append('password', adminPw); fd.append('scenario', sessionScenario);
+      fd.append('lang', sessionLang);
+      openerData = await (await fetch('/api/opening',{method:'POST',body:fd})).json();
+    }catch(e){ openerData=null; }
+    openerPromise=null;
+    return openerData;
+  })();
+  return openerPromise;
 }
 
 function scheduleFiller(){}
@@ -573,7 +580,14 @@ function connectWS(){
     const to=setTimeout(()=>reject(new Error('ws timeout')), 3500);
     ws.onopen=()=>{ clearTimeout(to); ws.send(JSON.stringify({type:'hello', password: adminPw, scenario: sessionScenario, lang: sessionLang})); resolve(); };
     ws.onerror=(e)=>{ clearTimeout(to); reject(e); };
-    ws.onclose=()=>{ };
+    // If the socket drops MID-CALL (serverless WS duration cap, flaky mobile network), never
+    // leave a zombie call that ignores the caller forever: end it visibly and cleanly.
+    ws.onclose=()=>{
+      if(listening && !endingCall){
+        sysNote('📴 Line dropped — call ended. Tap Start to call again.');
+        endCall();
+      }
+    };
     ws.onmessage=onWsMessage;
   });
 }
